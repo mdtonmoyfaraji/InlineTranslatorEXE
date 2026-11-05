@@ -1,0 +1,57 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Run the logic tests (does not block the build)
+        continue-on-error: true
+        run: python -m unittest discover -s tests -v
+
+      - name: Build InlineTranslator.exe
+        run: pyinstaller InlineTranslator.spec --noconfirm --clean
+
+      - name: Check that the exe exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/InlineTranslator.exe)) { throw "dist/InlineTranslator.exe was not created" }
+          $mb = [math]::Round((Get-Item dist/InlineTranslator.exe).Length / 1MB, 1)
+          Write-Host "InlineTranslator.exe is $mb MB"
+
+      - name: Upload the exe as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InlineTranslator-windows
+          path: dist/InlineTranslator.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach the exe to a GitHub Release (only for v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/InlineTranslator.exe
