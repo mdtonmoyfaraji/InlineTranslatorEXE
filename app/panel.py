@@ -11,14 +11,16 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect, 
                                QStyledItemDelegate, QStyleOptionViewItem, QTextEdit, QVBoxLayout, QWidget)
 
 from . import theme, winapi
-from .languages import (AUTO, CUSTOM_PREFIX, LANGUAGES, find_language, language_name,
+from .languages import (AUTO, CUSTOM_PREFIX, LANGUAGES, NONE, find_language, language_name,
                         make_custom_language_code, search_languages)
 from .settings import Prefs
+from .tones import (MAX_CUSTOM_TONE_LENGTH, TONE_DEFAULT, TONES, find_tone, is_custom_tone,
+                    make_custom_tone_code, search_tones, tone_name)
 
 log = logging.getLogger("inline_translator.panel")
 
 MARGIN = 16  # transparent margin around the card (room for the shadow)
-CARD_WIDTH = 360
+CARD_WIDTH = 392
 ROLE = Qt.ItemDataRole.UserRole
 
 
@@ -295,7 +297,7 @@ class LangList(QListWidget):
 # ----------------------------------------------------------------------------- panel
 
 class TranslatorPanel(QWidget):
-    submitted = Signal(str, str, str)  # text, source, target
+    submitted = Signal(str, str, str, str)  # text, source, target, tone
     closed = Signal(str)               # "cancel" | "done" | "outside"
     prefs_changed = Signal(dict)
     open_settings = Signal()
@@ -309,7 +311,8 @@ class TranslatorPanel(QWidget):
         self.setWindowTitle("Inline Translator")
         self.t = theme.tokens(dark)
         self.setStyleSheet(theme.panel_qss(self.t))
-        self.prefs = Prefs(prefs.source_lang, prefs.target_lang, list(prefs.recent), list(prefs.favorites), prefs.theme)
+        self.prefs = Prefs(prefs.source_lang, prefs.target_lang, list(prefs.recent), list(prefs.favorites),
+                           prefs.tone, list(prefs.tone_recent), list(prefs.tone_favorites), prefs.theme)
         self.needs_setup = needs_setup
         self.standalone = standalone
         self.busy = False
@@ -342,6 +345,7 @@ class TranslatorPanel(QWidget):
         bar.setSpacing(2)
         self.src_btn = self._picker_button("source")
         self.dst_btn = self._picker_button("target")
+        self.tone_btn = self._picker_button("tone")
         self.swap_btn = IconButton("swap", "Swap languages", self.t)
         self.swap_btn.clicked.connect(self.swap)
         close_btn = IconButton("close", "Close (Esc)", self.t)
@@ -349,6 +353,8 @@ class TranslatorPanel(QWidget):
         bar.addWidget(self.src_btn)
         bar.addWidget(self.swap_btn)
         bar.addWidget(self.dst_btn)
+        bar.addSpacing(4)
+        bar.addWidget(self.tone_btn)
         bar.addStretch(1)
         bar.addWidget(close_btn)
         lay.addLayout(bar)
@@ -424,39 +430,117 @@ class TranslatorPanel(QWidget):
 
         self._refresh_labels()
         self._update_swap_state()
-        if standalone:
-            self.input.setPlaceholderText("Type to translate… (the result is copied to the clipboard)")
 
     # ---- construction helpers ----------------------------------------------------
     def _picker_button(self, mode: str) -> QPushButton:
         b = QPushButton()
         b.setObjectName("picker")
         b.setCursor(Qt.CursorShape.PointingHandCursor)
-        b.setMaximumWidth(140)
+        b.setMinimumWidth(36)
+        b.setMaximumWidth(112)
+        b.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         b.clicked.connect(lambda: self._toggle_picker(mode))
         return b
 
-    def _label_for(self, mode: str) -> str:
-        code = self.prefs.source_lang if mode == "source" else self.prefs.target_lang
-        return ("Auto-detect" if code == AUTO else language_name(code)) + "  ▾"
+    def _button_text(self, mode: str) -> str:
+        if mode == "source":
+            return "Auto-detect" if self.prefs.source_lang == AUTO else language_name(self.prefs.source_lang)
+        if mode == "target":
+            return language_name(self.prefs.target_lang)
+        return "Tone" if self.prefs.tone == TONE_DEFAULT else tone_name(self.prefs.tone)
+
+    _KIND = {"source": "Source language", "target": "Target language", "tone": "Tone"}
 
     def _refresh_labels(self) -> None:
-        for btn, mode in ((self.src_btn, "source"), (self.dst_btn, "target")):
-            text = self._label_for(mode)
+        tone_only = self.prefs.target_lang == NONE
+        for btn, mode in ((self.src_btn, "source"), (self.dst_btn, "target"), (self.tone_btn, "tone")):
+            text = self._button_text(mode)
             fm = btn.fontMetrics()
-            btn.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, 124))
-            btn.setToolTip(("Source language" if mode == "source" else "Target language") + ": " + text.replace("  ▾", ""))
+            btn.setText(fm.elidedText(text + "  ▾", Qt.TextElideMode.ElideRight, 100))
+            btn.setToolTip(f"{self._KIND[mode]}: {text}")
             btn.setProperty("open", self._picker_mode == mode)
+            if mode == "tone":
+                btn.setProperty("tone", "active" if self.prefs.tone != TONE_DEFAULT else "idle")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+        # Tone-only mode keeps the input language: the source language and swap make no sense.
+        self.src_btn.setVisible(not tone_only)
+        self.swap_btn.setVisible(not tone_only)
+        self.input.setPlaceholderText(
+            "Type text to rewrite in the chosen tone…" if tone_only
+            else ("Type to translate… (the result is copied to the clipboard)" if self.standalone else "Type to translate…"))
+        if self._opened:
+            self._relayout()
 
     def _update_swap_state(self) -> None:
         auto = self.prefs.source_lang == AUTO
         self.swap_btn.setEnabled(not auto)
         self.swap_btn.setToolTip("Choose a source language to swap" if auto else "Swap languages")
 
-    # ---- language picker ---------------------------------------------------------
+    # ---- picker models: languages (source / target) and tones share one dropdown ----------
+    @staticmethod
+    def _lang_item(code: str, label: str, sub: str = "", starrable: bool = True) -> dict[str, Any]:
+        return {"code": code, "label": label, "native": sub, "starrable": starrable}
+
+    def _lang_item_for(self, code: str) -> dict[str, Any] | None:
+        lang = find_language(code)
+        if lang:
+            return self._lang_item(code, lang.name, lang.native if lang.native != lang.name else "")
+        if code.startswith(CUSTOM_PREFIX):
+            return self._lang_item(code, language_name(code), "custom")
+        return None
+
+    def _tone_item_for(self, code: str) -> dict[str, Any] | None:
+        t = find_tone(code)
+        if t:
+            return self._lang_item(code, t.name, t.hint)
+        if is_custom_tone(code):
+            return self._lang_item(code, tone_name(code), "custom")
+        return None
+
+    def _model(self, mode: str) -> dict[str, Any]:
+        if mode == "tone":
+            def custom(q: str, found: list[dict[str, Any]]):
+                if any(i["label"].lower() == q.lower() for i in found) or len(q) > MAX_CUSTOM_TONE_LENGTH:
+                    return None
+                return self._lang_item(make_custom_tone_code(q), f"Custom tone: “{q}”", "custom", False)
+
+            return {
+                "placeholder": "Search or type your own tone…",
+                "pinned": [self._lang_item(TONE_DEFAULT, "Default", "no tone", False)],
+                "all": [self._lang_item(t.code, t.name, t.hint) for t in TONES],
+                "all_label": "All tones",
+                "resolve": self._tone_item_for,
+                "search": lambda q: [self._lang_item(t.code, t.name, t.hint) for t in search_tones(q)],
+                "custom": custom,
+                "current": self.prefs.tone,
+                "favorites": self.prefs.tone_favorites,
+                "recent": self.prefs.tone_recent,
+            }
+
+        def lang_custom(q: str, found: list[dict[str, Any]]):
+            if any(i["label"].lower() == q.lower() for i in found) or len(q) > 40:
+                return None
+            return self._lang_item(make_custom_language_code(q), f"Use “{q}”", "custom", False)
+
+        pinned = ([self._lang_item(AUTO, "Detect language", "", False)] if mode == "source"
+                  else [self._lang_item(NONE, "No translation", "tone only", False)])
+        return {
+            "placeholder": "Translate from…" if mode == "source" else "Translate to…",
+            "pinned": pinned,
+            "all": [self._lang_item(l.code, l.name, l.native if l.native != l.name else "") for l in LANGUAGES],
+            "all_label": "All languages",
+            "resolve": self._lang_item_for,
+            "search": lambda q: [self._lang_item(l.code, l.name, l.native if l.native != l.name else "")
+                                 for l in search_languages(q)],
+            "custom": lang_custom,
+            "current": self.prefs.source_lang if mode == "source" else self.prefs.target_lang,
+            "favorites": self.prefs.favorites,
+            "recent": self.prefs.recent,
+        }
+
+    # ---- language / tone picker ------------------------------------------------------
     def _toggle_picker(self, mode: str) -> None:
         if self._picker_mode == mode:
             self._close_picker()
@@ -465,7 +549,7 @@ class TranslatorPanel(QWidget):
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
-        self.search.setPlaceholderText("Translate from…" if mode == "source" else "Translate to…")
+        self.search.setPlaceholderText(self._model(mode)["placeholder"])
         self.picker_box.show()
         self._render_rows()
         self.search.setFocus()
@@ -482,44 +566,38 @@ class TranslatorPanel(QWidget):
         self._relayout()
 
     def _build_rows(self) -> list[dict[str, Any]]:
-        mode = self._picker_mode
+        m = self._model(self._picker_mode or "target")
         q = self.search.text().strip()
-        favs = set(self.prefs.favorites)
-        current = self.prefs.source_lang if mode == "source" else self.prefs.target_lang
+        favs = set(m["favorites"])
+        current = m["current"]
 
-        def opt(code: str, label: str, native: str = "", starrable: bool = True) -> dict[str, Any]:
-            return {"kind": "opt", "code": code, "label": label, "native": native, "starrable": starrable,
-                    "fav": code in favs, "selected": code == current, "active": False}
-
-        def from_code(code: str) -> dict[str, Any] | None:
-            lang = find_language(code)
-            if lang:
-                return opt(code, lang.name, lang.native if lang.native != lang.name else "")
-            if code.startswith(CUSTOM_PREFIX):
-                return opt(code, language_name(code), "custom")
-            return None
+        def opt(item: dict[str, Any]) -> dict[str, Any]:
+            return {"kind": "opt", "code": item["code"], "label": item["label"], "native": item["native"],
+                    "starrable": item["starrable"], "fav": item["code"] in favs,
+                    "selected": item["code"] == current, "active": False}
 
         rows: list[dict[str, Any]] = []
         if not q:
-            if mode == "source":
-                rows.append(opt(AUTO, "Detect language", starrable=False))
-            fav_rows = [r for r in map(from_code, self.prefs.favorites) if r]
-            if fav_rows:
+            rows += [opt(i) for i in m["pinned"]]
+            fav_items = [i for i in map(m["resolve"], m["favorites"]) if i]
+            if fav_items:
                 rows.append({"kind": "group", "label": "Favorites"})
-                rows += fav_rows
-            rec_rows = [r for r in map(from_code, [c for c in self.prefs.recent if c not in favs]) if r]
-            if rec_rows:
+                rows += [opt(i) for i in fav_items]
+            rec_items = [i for i in map(m["resolve"], [c for c in m["recent"] if c not in favs]) if i]
+            if rec_items:
                 rows.append({"kind": "group", "label": "Recent"})
-                rows += rec_rows
-            rows.append({"kind": "group", "label": "All languages"})
-            rows += [opt(l.code, l.name, l.native if l.native != l.name else "") for l in LANGUAGES]
+                rows += [opt(i) for i in rec_items]
+            rows.append({"kind": "group", "label": m["all_label"]})
+            rows += [opt(i) for i in m["all"]]
             return rows
-        found = search_languages(q)
-        if mode == "source" and q.lower() in "detect automatically":
-            rows.append(opt(AUTO, "Detect language", starrable=False))
-        rows += [opt(l.code, l.name, l.native if l.native != l.name else "") for l in found]
-        if not any(l.name.lower() == q.lower() for l in found) and len(q) <= 40:
-            rows.append(opt(make_custom_language_code(q), f"Use “{q}”", "custom", starrable=False))
+        lower = q.lower()
+        rows += [opt(i) for i in m["pinned"] if lower in i["label"].lower()
+                 or (self._picker_mode == "source" and lower in "detect automatically")]
+        found = m["search"](q)
+        rows += [opt(i) for i in found]
+        extra = m["custom"](q, found)
+        if extra:
+            rows.append(opt(extra))
         return rows
 
     def _render_rows(self, *_):
@@ -538,7 +616,7 @@ class TranslatorPanel(QWidget):
                     selected = i
         self.langs.setUpdatesEnabled(True)
         if first_opt < 0:
-            self.langs.addItem(QListWidgetItem("No languages found"))
+            self.langs.addItem(QListWidgetItem("Nothing found"))
             return
         self.langs.set_active_row(first_opt if self.search.text().strip() or selected < 0 else selected)
 
@@ -563,15 +641,22 @@ class TranslatorPanel(QWidget):
         elif mode == "target" and code != AUTO:
             self.prefs.target_lang = code
             self.prefs_changed.emit({"target_lang": code})
-        self._refresh_labels()
+        elif mode == "tone":
+            self.prefs.tone = code
+            self.prefs_changed.emit({"tone": code})
         self._update_swap_state()
-        self._close_picker()
+        self._close_picker()  # also refreshes the button labels and the tone-only layout
 
     def _toggle_favorite(self, code: str) -> None:
-        favs = self.prefs.favorites
+        tone = self._picker_mode == "tone"
+        favs = list(self.prefs.tone_favorites if tone else self.prefs.favorites)
         favs = [c for c in favs if c != code] if code in favs else (favs + [code])[-30:]
-        self.prefs.favorites = favs
-        self.prefs_changed.emit({"favorites": favs})
+        if tone:
+            self.prefs.tone_favorites = favs
+            self.prefs_changed.emit({"tone_favorites": favs})
+        else:
+            self.prefs.favorites = favs
+            self.prefs_changed.emit({"favorites": favs})
         scroll = self.langs.verticalScrollBar().value()
         active = self.langs.active_row()
         self._render_rows()
@@ -580,7 +665,7 @@ class TranslatorPanel(QWidget):
             self.langs.set_active_row(min(active, self.langs.count() - 1))
 
     def swap(self) -> None:
-        if self.prefs.source_lang == AUTO:
+        if self.prefs.source_lang == AUTO or self.prefs.target_lang == NONE:
             return
         self.prefs.source_lang, self.prefs.target_lang = self.prefs.target_lang, self.prefs.source_lang
         self._refresh_labels()
@@ -589,6 +674,7 @@ class TranslatorPanel(QWidget):
 
     def update_prefs(self, prefs: Prefs) -> None:
         self.prefs.recent = list(prefs.recent)
+        self.prefs.tone_recent = list(prefs.tone_recent)
 
     # ---- state display -----------------------------------------------------------
     def _on_status_action(self) -> None:
@@ -648,7 +734,10 @@ class TranslatorPanel(QWidget):
         if not text:
             self.input.setFocus()
             return
-        self.submitted.emit(text, self.prefs.source_lang, self.prefs.target_lang)
+        if self.prefs.target_lang == NONE and self.prefs.tone == TONE_DEFAULT:
+            self.show_notice("“No translation” needs a tone. Choose a tone, or pick a target language.")
+            return
+        self.submitted.emit(text, self.prefs.source_lang, self.prefs.target_lang, self.prefs.tone)
 
     # ---- layout / positioning -------------------------------------------------------
     def eventFilter(self, obj, ev):  # noqa: N802
@@ -692,10 +781,16 @@ class TranslatorPanel(QWidget):
         if (x, y) != (self.x(), self.y()):
             self.move(x, y)
 
-    def open_at(self, anchor: QRect, avail: QRect) -> None:
-        """``anchor`` is the caret/mouse rectangle in Qt logical screen coordinates."""
+    def open_at(self, anchor: QRect, avail: QRect, prefill: str = "", prefill_note: str = "") -> None:
+        """``anchor`` is the caret/mouse rectangle in Qt logical screen coordinates.
+        ``prefill`` is the text that was selected in the other program."""
         self._anchor_avail = avail
         self._anchor_rect = anchor
+        if prefill:
+            self.input.setPlainText(prefill)
+            cursor = self.input.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.input.setTextCursor(cursor)
         self.layout().activate()
         self.adjustSize()
         w, h = self.width(), self.height()
@@ -716,6 +811,8 @@ class TranslatorPanel(QWidget):
             self.input.setPlaceholderText("Set up your AI connection to translate.")
             self.go.setEnabled(False)
             self.show_notice("No AI provider is configured yet.", "Open settings", self.open_settings.emit)
+        elif prefill_note:
+            self.show_notice(prefill_note)
         self.input.setFocus()
 
     def focus_input(self) -> None:

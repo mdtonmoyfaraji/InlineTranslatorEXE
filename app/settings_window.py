@@ -1,4 +1,4 @@
-"""Settings window: General, AI connection, Languages, Shortcut, About & privacy."""
+"""Settings window: General, AI connection, Languages & tones, Shortcut, About & privacy."""
 from __future__ import annotations
 
 import logging
@@ -14,10 +14,12 @@ from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit
 
 from . import __version__, theme, winapi
 from .ai import validate_api_config
-from .languages import AUTO, LANGUAGES, language_name
+from .languages import AUTO, LANGUAGES, NONE, language_name
 from .logging_setup import log_path
 from .settings import config_dir
 from .shortcut import ShortcutConfig, format_shortcut, is_modifier_only, validate_shortcut
+from .tones import (MAX_CUSTOM_TONE_LENGTH, TONE_DEFAULT, TONES, is_custom_tone, make_custom_tone_code,
+                    tone_name)
 from .widgets import (ShortcutRecorder, ToggleRow, card, field, make_label, repolish, separator, set_note)
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -101,7 +103,7 @@ class SettingsWindow(QWidget):
         for key, title, builder in (
             ("general", "General", self._build_general),
             ("connection", "AI connection", self._build_connection),
-            ("languages", "Languages", self._build_languages),
+            ("languages", "Languages & tones", self._build_languages),
             ("shortcut", "Shortcut", self._build_shortcut),
             ("about", "About & privacy", self._build_about),
         ):
@@ -138,6 +140,9 @@ class SettingsWindow(QWidget):
         self.cb_pos.setCurrentIndex(max(0, self.cb_pos.findData(s.app.panel_position)))
         self.cb_theme.setCurrentIndex(max(0, self.cb_theme.findData(s.prefs.theme)))
         self.row_notify.set_checked(s.app.notifications)
+        self.row_prefill.set_checked(s.app.prefill_selection)
+        self.row_bubble.set_checked(s.app.selection_bubble)
+        self.row_copyfb.set_checked(s.app.copy_fallback)
         self._load_connection()
         self._load_languages()
         self.sc_cfg = deepcopy(s.shortcut)
@@ -145,7 +150,8 @@ class SettingsWindow(QWidget):
 
     def apply_theme(self, dark: bool) -> None:
         self.t = theme.tokens(dark)
-        for row in (self.row_autostart, self.row_restore, self.row_notify, self.row_sc_enabled):
+        for row in (self.row_autostart, self.row_restore, self.row_notify, self.row_sc_enabled,
+                    self.row_prefill, self.row_bubble, self.row_copyfb):
             row.switch.set_tokens(self.t)
 
     # ===================================================================== General
@@ -160,7 +166,7 @@ class SettingsWindow(QWidget):
         self.row_restore = ToggleRow("Restore my clipboard after pasting",
                                      "Your previous clipboard content is put back a moment after the translation is pasted.", self.t)
         self.row_restore.toggled.connect(lambda v: self._save_app("restore_clipboard", v))
-        self.cb_pos = _combo([("Near the text cursor (falls back to the mouse)", "caret"), ("Near the mouse pointer", "mouse"),
+        self.cb_pos = _combo([("Near the text cursor", "caret"), ("Near the mouse pointer", "mouse"),
                               ("Centre of the screen", "center")], s.app.panel_position)
         self.cb_pos.currentIndexChanged.connect(lambda _=0: self._save_app("panel_position", self.cb_pos.currentData()))
         self.cb_theme = _combo([("Follow Windows", "system"), ("Light", "light"), ("Dark", "dark")], s.prefs.theme)
@@ -175,7 +181,21 @@ class SettingsWindow(QWidget):
         lay.addWidget(card(field("Insert method", self.cb_insert,
                                  "Paste works in almost every program. “Type” sends the text as keystrokes; use it where Ctrl+V is blocked."),
                            self.row_restore))
-        lay.addWidget(card(field("Where the translator opens", self.cb_pos), field("Appearance", self.cb_theme)))
+        self.row_prefill = ToggleRow("Load the selected text into the panel",
+                                     "Select text in any program and press the shortcut: it appears in the panel, and Enter replaces the "
+                                     "selection with the result. Read-only text (web pages) shows the result in the panel instead.", self.t)
+        self.row_prefill.toggled.connect(lambda v: self._save_app("prefill_selection", v))
+        self.row_bubble = ToggleRow("Show a translate bubble next to selected text",
+                                    "After you select text with the mouse a small round button appears; click it to translate the selection. "
+                                    "Works in programs that report their selection (browsers, Office, Notepad…).", self.t)
+        self.row_bubble.toggled.connect(lambda v: self._save_app("selection_bubble", v))
+        self.row_copyfb = ToggleRow("Copy the selection with Ctrl+Insert in other programs",
+                                    "For programs that cannot report their selection (many editors). Your clipboard is restored afterwards.", self.t)
+        self.row_copyfb.toggled.connect(lambda v: self._save_app("copy_fallback", v))
+        lay.addWidget(card(field("Where the translator opens", self.cb_pos,
+                                 "“Near the text cursor” finds the cursor in browsers and modern apps too. Use the tray item "
+                                 "“Test cursor detection” if a program opens it in the wrong place."), field("Appearance", self.cb_theme)))
+        lay.addWidget(card(make_label("Selected text", name="h2"), self.row_prefill, separator(), self.row_bubble, separator(), self.row_copyfb))
         lay.addWidget(card(self.row_notify))
         lay.addStretch(1)
         return area
@@ -329,12 +349,13 @@ class SettingsWindow(QWidget):
         self.ctrl.apply_settings()
         set_note(self.conn_status, "info", "The saved API key was removed.")
 
-    # ==================================================================== Languages
+    # =========================================================== Languages & tones
     def _build_languages(self) -> QWidget:
-        area, lay = _page("Languages", "Defaults for the translator panel, and your favourite languages.")
+        area, lay = _page("Languages & tones", "Defaults for the translator panel, your favourites, and the writing tones.")
         self.cb_src = QComboBox()
         self.cb_src.addItem("Detect language", AUTO)
         self.cb_dst = QComboBox()
+        self.cb_dst.addItem("No translation (tone only)", NONE)
         for l in LANGUAGES:
             label = l.name if l.native == l.name else f"{l.name} — {l.native}"
             self.cb_src.addItem(label, l.code)
@@ -343,16 +364,26 @@ class SettingsWindow(QWidget):
         self.cb_dst.setMaxVisibleItems(16)
         self.cb_src.currentIndexChanged.connect(lambda _=0: self._save_pref("source_lang", self.cb_src.currentData()))
         self.cb_dst.currentIndexChanged.connect(lambda _=0: self._save_pref("target_lang", self.cb_dst.currentData()))
-        both = QHBoxLayout()
-        both.setSpacing(14)
-        both.addWidget(field("Default source language", self.cb_src), 1)
-        both.addWidget(field("Default target language", self.cb_dst), 1)
-        holder = QWidget()
-        holder.setLayout(both)
-        both.setContentsMargins(0, 0, 0, 0)
+        self.cb_tone = QComboBox()
+        self.cb_tone.addItem("Default (no tone)", TONE_DEFAULT)
+        for t in TONES:
+            self.cb_tone.addItem(f"{t.name} – {t.hint}", t.code)
+        self.cb_tone.setMaxVisibleItems(16)
+        self.cb_tone.currentIndexChanged.connect(lambda _=0: self._save_pref("tone", self.cb_tone.currentData()))
 
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        row.addWidget(field("Default source language", self.cb_src), 1)
+        row.addWidget(field("Default target language", self.cb_dst), 1)
+        holder = QWidget()
+        holder.setLayout(row)
+        row.setContentsMargins(0, 0, 0, 0)
+        tone_holder = field("Default tone", self.cb_tone,
+                            "Pick “No translation (tone only)” as the target to rewrite text in the language you typed, using the tone.")
+
+        # ---- favourite languages
         self.fav_list = QListWidget()
-        self.fav_list.setFixedHeight(170)
+        self.fav_list.setFixedHeight(130)
         self.cb_fav_add = QComboBox()
         self.cb_fav_add.setMaxVisibleItems(16)
         for l in LANGUAGES:
@@ -370,32 +401,80 @@ class SettingsWindow(QWidget):
         rm_row.addWidget(btn_rm)
         rm_row.addWidget(btn_clear_recent)
         rm_row.addStretch(1)
-
-        lay.addWidget(card(holder))
-        fav_card = card(make_label("Favourites", name="h2"),
+        fav_card = card(make_label("Favourite languages", name="h2"),
                         make_label("Favourites are listed first in the language picker. You can also star languages directly in the panel.", "hint"))
         fav_card.layout().addWidget(self.fav_list)
         fav_card.layout().addLayout(add_row)
         fav_card.layout().addLayout(rm_row)
+
+        # ---- tones
+        self.ed_tone = QLineEdit()
+        self.ed_tone.setMaxLength(MAX_CUSTOM_TONE_LENGTH)
+        self.ed_tone.setPlaceholderText("e.g. friendly but firm, pirate, Shakespearean…")
+        self.ed_tone.returnPressed.connect(self._add_custom_tone)
+        btn_tone = QPushButton("Add custom tone")
+        btn_tone.clicked.connect(self._add_custom_tone)
+        self.tone_msg = make_label("", "hint")
+        tone_row = QHBoxLayout()
+        tone_row.addWidget(self.ed_tone, 1)
+        tone_row.addWidget(btn_tone)
+        self.tone_fav_list = QListWidget()
+        self.tone_fav_list.setFixedHeight(110)
+        btn_tone_rm = QPushButton("Remove selected tone")
+        btn_tone_rm.clicked.connect(self._remove_tone_favorite)
+        btn_tone_clear = QPushButton("Clear recent tones")
+        btn_tone_clear.clicked.connect(self._clear_recent_tones)
+        tone_rm_row = QHBoxLayout()
+        tone_rm_row.addWidget(btn_tone_rm)
+        tone_rm_row.addWidget(btn_tone_clear)
+        tone_rm_row.addStretch(1)
+        tone_card = card(make_label("Tones", name="h2"),
+                         make_label("Built-in tones: " + ", ".join(t.name for t in TONES) + ". In the panel you can also type any tone "
+                                    "into the tone search. Describe how the text should sound; it is saved to your favourite tones and "
+                                    "becomes the default tone.", "hint"),
+                         make_label("Custom tone", "label"))
+        tone_card.layout().addLayout(tone_row)
+        tone_card.layout().addWidget(self.tone_msg)
+        tone_card.layout().addWidget(make_label("Favourite tones (including your own)", "label"))
+        tone_card.layout().addWidget(self.tone_fav_list)
+        tone_card.layout().addLayout(tone_rm_row)
+
+        lay.addWidget(card(holder, tone_holder))
         lay.addWidget(fav_card)
+        lay.addWidget(tone_card)
         lay.addStretch(1)
         return area
 
+    @staticmethod
+    def _select_data(cb: QComboBox, code: str, label: str) -> None:
+        """Selects ``code`` in a combo box, adding a one-off entry for custom values."""
+        cb.blockSignals(True)
+        i = cb.findData(code)
+        if i < 0:
+            cb.addItem(label, code)
+            i = cb.count() - 1
+        cb.setCurrentIndex(i)
+        cb.blockSignals(False)
+
     def _load_languages(self) -> None:
         p = self.store.settings.prefs
-        for cb, code in ((self.cb_src, p.source_lang), (self.cb_dst, p.target_lang)):
-            cb.blockSignals(True)
-            i = cb.findData(code)
-            cb.setCurrentIndex(i if i >= 0 else 0)
-            cb.blockSignals(False)
+        self._select_data(self.cb_src, p.source_lang, language_name(p.source_lang))
+        self._select_data(self.cb_dst, p.target_lang, language_name(p.target_lang))
+        self._select_data(self.cb_tone, p.tone, "Custom: " + tone_name(p.tone))
         self._refresh_favorites()
 
     def _refresh_favorites(self) -> None:
+        p = self.store.settings.prefs
         self.fav_list.clear()
-        for code in self.store.settings.prefs.favorites:
+        for code in p.favorites:
             it = QListWidgetItem(language_name(code))
             it.setData(Qt.ItemDataRole.UserRole, code)
             self.fav_list.addItem(it)
+        self.tone_fav_list.clear()
+        for code in p.tone_favorites:
+            it = QListWidgetItem(tone_name(code) + ("   (custom)" if is_custom_tone(code) else ""))
+            it.setData(Qt.ItemDataRole.UserRole, code)
+            self.tone_fav_list.addItem(it)
 
     def _save_pref(self, name: str, value) -> None:
         setattr(self.store.settings.prefs, name, value)
@@ -420,6 +499,33 @@ class SettingsWindow(QWidget):
 
     def _clear_recent(self) -> None:
         self.store.settings.prefs.recent = []
+        self.ctrl.apply_settings()
+
+    def _add_custom_tone(self) -> None:
+        text = self.ed_tone.text().strip()
+        if not text:
+            self.tone_msg.setText("Describe the tone first.")
+            return
+        code = make_custom_tone_code(text)
+        p = self.store.settings.prefs
+        p.tone_favorites = ([code] + [c for c in p.tone_favorites if c != code])[:30]
+        p.tone = code
+        self.ed_tone.clear()
+        self.tone_msg.setText(f"Added “{tone_name(code)}” and set it as the default tone.")
+        self.ctrl.apply_settings()
+        self._load_languages()
+
+    def _remove_tone_favorite(self) -> None:
+        it = self.tone_fav_list.currentItem()
+        if it:
+            code = it.data(Qt.ItemDataRole.UserRole)
+            p = self.store.settings.prefs
+            p.tone_favorites = [c for c in p.tone_favorites if c != code]
+            self.ctrl.apply_settings()
+            self._refresh_favorites()
+
+    def _clear_recent_tones(self) -> None:
+        self.store.settings.prefs.tone_recent = []
         self.ctrl.apply_settings()
 
     # ===================================================================== Shortcut

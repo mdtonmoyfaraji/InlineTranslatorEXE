@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # needed only to attach the exe to a GitHub Release when you push a tag like v1.0.1
 
 jobs:
   build:

@@ -84,6 +84,10 @@ if IS_WINDOWS:
         _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
                     ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
 
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("pt", POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
     HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
     def _bind(fn, argtypes, restype):
@@ -110,6 +114,8 @@ if IS_WINDOWS:
     _bind(user32.TranslateMessage, [ctypes.POINTER(wintypes.MSG)], wintypes.BOOL)
     _bind(user32.DispatchMessageW, [ctypes.POINTER(wintypes.MSG)], LRESULT)
     _bind(user32.PostThreadMessageW, [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.BOOL)
+    _bind(user32.GetClassNameW, [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
+    _bind(user32.GetDoubleClickTime, [], wintypes.UINT)
     _bind(kernel32.GetCurrentThreadId, [], wintypes.DWORD)
     _bind(kernel32.GetModuleHandleW, [wintypes.LPCWSTR], wintypes.HMODULE)
     _bind(kernel32.CreateMutexW, [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR], wintypes.HANDLE)
@@ -122,8 +128,11 @@ if IS_WINDOWS:
     KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_UNICODE = 0x0004
     VK_BACK, VK_RETURN, VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_V = 0x08, 0x0D, 0x10, 0x11, 0x12, 0x5B, 0x5C, 0x56
+    VK_INSERT = 0x2D
+    KEYEVENTF_EXTENDEDKEY = 0x0001
     SW_RESTORE = 9
     WH_KEYBOARD_LL = 13
+    WH_MOUSE_LL = 14
     WM_QUIT = 0x0012
     ERROR_ALREADY_EXISTS = 183
 
@@ -179,6 +188,43 @@ def force_foreground(hwnd: int) -> bool:
     except Exception:
         log.exception("force_foreground failed")
         return False
+
+
+def window_class(hwnd: int) -> str:
+    if not IS_WINDOWS or not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def window_rect(hwnd: int) -> Rect | None:
+    """Outer rectangle of a window in physical screen pixels."""
+    if not IS_WINDOWS or not hwnd:
+        return None
+    rc = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+        return None
+    return Rect(rc.left, rc.top, rc.right, rc.bottom)
+
+
+def focused_control(hwnd: int) -> int:
+    """The control with keyboard focus inside the foreground window's thread (may be 0)."""
+    if not IS_WINDOWS or not hwnd:
+        return 0
+    try:
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            return int(info.hwndFocus or 0)
+    except Exception:
+        log.exception("focused_control failed")
+    return 0
+
+
+def double_click_ms() -> int:
+    return int(user32.GetDoubleClickTime()) if IS_WINDOWS else 500
 
 
 def get_caret_screen_rect() -> Rect | None:
@@ -248,6 +294,16 @@ def send_ctrl_v() -> bool:
     if not IS_WINDOWS:
         return False
     ev = [_kb(VK_CONTROL), _kb(VK_V), _kb(VK_V, flags=KEYEVENTF_KEYUP), _kb(VK_CONTROL, flags=KEYEVENTF_KEYUP)]
+    return _send(ev) == len(ev)
+
+
+def send_copy() -> bool:
+    """Ctrl+Insert = "copy" in nearly every Windows program. Unlike Ctrl+C it never sends an
+    interrupt (SIGINT) to a terminal when nothing is selected."""
+    if not IS_WINDOWS:
+        return False
+    ev = [_kb(VK_CONTROL), _kb(VK_INSERT, flags=KEYEVENTF_EXTENDEDKEY),
+          _kb(VK_INSERT, flags=KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP), _kb(VK_CONTROL, flags=KEYEVENTF_KEYUP)]
     return _send(ev) == len(ev)
 
 

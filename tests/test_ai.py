@@ -137,6 +137,15 @@ class AiTests(unittest.TestCase):
         ok, msg = AIClient().test_connection(self.cfg)
         self.assertTrue(ok, msg)
 
+    def test_tone_and_tone_only_requests(self):
+        c = AIClient()
+        self.assertIn("HELLO", c.translate(self.cfg, "hello", "en", "fr", "viking"))
+        self.assertIn("HELLO", c.translate(self.cfg, "hello", "auto", "none", "zen"))
+        with self.assertRaises(AIError):
+            c.translate(self.cfg, "hello", "auto", "none")  # tone only needs a tone
+        with self.assertRaises(AIError):
+            c.translate(self.cfg, "hello", "en", "fr", "not-a-tone")
+
     def test_prompt_and_clean(self):
         m = build_translation_messages("hi", "auto", "bn")
         self.assertIn("Bengali", m[0]["content"])

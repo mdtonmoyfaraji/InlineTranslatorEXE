@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import secure
-from .languages import AUTO, default_target_for_locale, is_valid_language_code
+from .languages import AUTO, NONE, default_target_for_locale, is_valid_language_code, is_valid_target_code
 from .shortcut import ShortcutConfig
+from .tones import TONE_DEFAULT, is_valid_tone_code
 
 log = logging.getLogger("inline_translator.settings")
 
@@ -56,6 +57,15 @@ def _code_list(v: Any, maximum: int) -> list[str]:
     return out[:maximum]
 
 
+def _tone_list(v: Any, maximum: int) -> list[str]:
+    out: list[str] = []
+    if isinstance(v, list):
+        for c in v:
+            if is_valid_tone_code(c) and c != TONE_DEFAULT and c not in out:
+                out.append(c)
+    return out[:maximum]
+
+
 @dataclass
 class ApiConfig:
     base_url: str = ""
@@ -76,6 +86,9 @@ class Prefs:
     target_lang: str = "en"
     recent: list[str] = field(default_factory=list)
     favorites: list[str] = field(default_factory=list)
+    tone: str = TONE_DEFAULT
+    tone_recent: list[str] = field(default_factory=list)
+    tone_favorites: list[str] = field(default_factory=list)
     theme: str = "system"
 
 
@@ -86,6 +99,9 @@ class AppOptions:
     restore_clipboard: bool = True
     panel_position: str = "caret"
     notifications: bool = True
+    prefill_selection: bool = True
+    selection_bubble: bool = True
+    copy_fallback: bool = True
 
 
 @dataclass
@@ -138,9 +154,12 @@ def sanitize(data: Any, base: Settings | None = None) -> Settings:
     tgt = p.get("target_lang")
     prefs = Prefs(
         source_lang=src if is_valid_language_code(src) else base.prefs.source_lang,
-        target_lang=tgt if is_valid_language_code(tgt) and tgt != AUTO else base.prefs.target_lang,
+        target_lang=tgt if is_valid_target_code(tgt) else base.prefs.target_lang,
         recent=_code_list(p["recent"], 8) if "recent" in p else list(base.prefs.recent),
         favorites=_code_list(p["favorites"], 30) if "favorites" in p else list(base.prefs.favorites),
+        tone=p.get("tone") if is_valid_tone_code(p.get("tone")) else base.prefs.tone,
+        tone_recent=_tone_list(p["tone_recent"], 8) if "tone_recent" in p else list(base.prefs.tone_recent),
+        tone_favorites=_tone_list(p["tone_favorites"], 30) if "tone_favorites" in p else list(base.prefs.tone_favorites),
         theme=_choice(p.get("theme"), THEMES, base.prefs.theme),
     )
 
@@ -151,6 +170,9 @@ def sanitize(data: Any, base: Settings | None = None) -> Settings:
         restore_clipboard=_bool(o.get("restore_clipboard"), base.app.restore_clipboard),
         panel_position=_choice(o.get("panel_position"), PANEL_POSITIONS, base.app.panel_position),
         notifications=_bool(o.get("notifications"), base.app.notifications),
+        prefill_selection=_bool(o.get("prefill_selection"), base.app.prefill_selection),
+        selection_bubble=_bool(o.get("selection_bubble"), base.app.selection_bubble),
+        copy_fallback=_bool(o.get("copy_fallback"), base.app.copy_fallback),
     )
     shortcut = ShortcutConfig.from_dict(d.get("shortcut"), base.shortcut)
     return Settings(api=api, prefs=prefs, shortcut=shortcut, app=app)
@@ -208,13 +230,16 @@ class SettingsStore:
             "api": api,
             "prefs": {
                 "source_lang": s.prefs.source_lang, "target_lang": s.prefs.target_lang,
-                "recent": s.prefs.recent, "favorites": s.prefs.favorites, "theme": s.prefs.theme,
+                "recent": s.prefs.recent, "favorites": s.prefs.favorites, "tone": s.prefs.tone,
+                "tone_recent": s.prefs.tone_recent, "tone_favorites": s.prefs.tone_favorites,
+                "theme": s.prefs.theme,
             },
             "shortcut": s.shortcut.to_dict(),
             "app": {
                 "start_with_windows": s.app.start_with_windows, "insert_method": s.app.insert_method,
                 "restore_clipboard": s.app.restore_clipboard, "panel_position": s.app.panel_position,
-                "notifications": s.app.notifications,
+                "notifications": s.app.notifications, "prefill_selection": s.app.prefill_selection,
+                "selection_bubble": s.app.selection_bubble, "copy_fallback": s.app.copy_fallback,
             },
         }
 
@@ -243,13 +268,17 @@ class SettingsStore:
     def subscribe(self, cb: Callable[[Settings], None]) -> None:
         self._listeners.append(cb)
 
-    def push_recent(self, source: str, target: str) -> None:
+    def push_recent(self, source: str, target: str, tone: str = TONE_DEFAULT) -> None:
+        """Remembers the languages / tone that were just used (tone-only runs do not touch languages)."""
         def push(lst: list[str], code: str) -> list[str]:
-            return [code] + [c for c in lst if c != code]
+            return ([code] + [c for c in lst if c != code])[:8]
 
-        recent = self.settings.prefs.recent
-        if source != AUTO:
-            recent = push(recent, source)
-        recent = push(recent, target)
-        self.settings.prefs.recent = recent[:8]
+        prefs = self.settings.prefs
+        if target != NONE:
+            recent = prefs.recent
+            if source != AUTO:
+                recent = push(recent, source)
+            prefs.recent = push(recent, target)
+        if tone != TONE_DEFAULT:
+            prefs.tone_recent = push(prefs.tone_recent, tone)
         self.save(notify=False)

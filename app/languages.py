@@ -10,6 +10,7 @@ import unicodedata
 from typing import NamedTuple
 
 AUTO = "auto"
+NONE = "none"  # target meaning "do not translate, only apply the tone"
 CUSTOM_PREFIX = "custom:"
 
 
@@ -138,6 +139,11 @@ def is_valid_language_code(code: object) -> bool:
     return isinstance(code, str) and LANGUAGE_CODE_RE.match(code) is not None
 
 
+def is_valid_target_code(code: object) -> bool:
+    """A target may also be NONE ("No translation"), but never AUTO."""
+    return code == NONE or (is_valid_language_code(code) and code != AUTO)
+
+
 def make_custom_language_code(name: str) -> str:
     return CUSTOM_PREFIX + name.strip()[:40]
 
@@ -150,6 +156,8 @@ def language_name(code: str) -> str:
     """English display name (this is also what is sent to the model)."""
     if code == AUTO:
         return "Detect language"
+    if code == NONE:
+        return "No translation"
     if code.startswith(CUSTOM_PREFIX):
         return code[len(CUSTOM_PREFIX):]
     lang = _BY_CODE.get(code)

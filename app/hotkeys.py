@@ -26,6 +26,7 @@ class HotkeyService(QObject):
 
     triggered = Signal(int, int)
     failed = Signal(str)
+    key_activity = Signal()  # first key press after ``watch_keys`` was set (hides the selection bubble)
 
     def __init__(self, cfg: ShortcutConfig, parent: QObject | None = None):
         super().__init__(parent)
@@ -41,6 +42,7 @@ class HotkeyService(QObject):
         self._down: set[int] = set()
         self._swallow_up: set[int] = set()
         self._ready = threading.Event()
+        self.watch_keys = False
 
     # ---- public ------------------------------------------------------------
     def start(self) -> None:
@@ -130,6 +132,10 @@ class HotkeyService(QObject):
             self._down.add(vk)
         else:
             self._down.discard(vk)
+
+        if is_down and self.watch_keys:
+            self.watch_keys = False
+            self.key_activity.emit()
 
         if vk in self._swallow_up:  # the completing key: swallow its auto-repeats and its key-up too
             if not is_down:

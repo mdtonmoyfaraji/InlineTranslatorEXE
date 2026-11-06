@@ -89,6 +89,8 @@ QWidget {{ background: transparent; }}
 
 QPushButton#picker {{ border: 0; border-radius: 8px; padding: 4px 8px; font-weight: 600; text-align: left; background: transparent; }}
 QPushButton#picker:hover, QPushButton#picker[open="true"] {{ background: {t['hover']}; }}
+QPushButton#picker[tone="idle"] {{ font-weight: 500; color: {t['muted']}; }}
+QPushButton#picker[tone="active"] {{ color: {t['accent']}; }}
 QPushButton#icon {{ border: 0; border-radius: 8px; background: transparent; color: {t['muted']}; padding: 0; }}
 QPushButton#icon:hover {{ background: {t['hover']}; }}
 QPushButton#icon:disabled {{ color: {t['line']}; }}

@@ -145,3 +145,57 @@ class Inserter(QObject):
             cb.setMimeData(previous)
         except Exception:
             log.exception("clipboard restore failed")
+
+
+class CopyCapture(QObject):
+    """Reads the current selection of programs that cannot report it, by sending Ctrl+Insert (copy).
+
+    The previous clipboard content is restored right after. Ctrl+Insert is used instead of Ctrl+C
+    because it never sends an interrupt to a terminal when nothing is selected.
+    """
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._busy = False
+
+    def capture(self, done: Callable[[str | None], None]) -> None:
+        if self._busy or not winapi.IS_WINDOWS:
+            done(None)
+            return
+        self._busy = True
+        clipboard = QGuiApplication.clipboard()
+        previous = _snapshot_clipboard()
+        sentinel = f"\u200b__inline_translator_probe_{time.monotonic_ns()}__"
+        Inserter._copy(sentinel)
+
+        def finish(text: str | None) -> None:
+            self._busy = False
+            try:
+                if previous is not None:
+                    clipboard.setMimeData(previous)
+                else:
+                    clipboard.clear()
+            except Exception:
+                log.exception("clipboard restore failed")
+            done(text)
+
+        def poll(deadline: float) -> None:
+            mime = clipboard.mimeData()
+            text = mime.text() if mime is not None and mime.hasText() else ""
+            if text and text != sentinel:
+                finish(text)
+            elif time.monotonic() > deadline:
+                finish(None)
+            else:
+                QTimer.singleShot(20, lambda: poll(deadline))
+
+        def send(until: float) -> None:
+            if winapi.physical_modifiers_down() and time.monotonic() < until:
+                QTimer.singleShot(25, lambda: send(until))
+                return
+            if not winapi.send_copy():
+                finish(None)
+                return
+            poll(time.monotonic() + 0.45)
+
+        QTimer.singleShot(0, lambda: send(time.monotonic() + 0.7))
